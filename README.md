@@ -58,7 +58,7 @@ directly from your Mac. No Terminal. No scripts. Just drag, drop, and sign.
 
 ### Installation
 
-**Option 1 — Build from source (recommended)**
+**Build from source (recommended)**
 
 ```bash
 # Clone the repository
@@ -70,10 +70,6 @@ open iResignX.xcodeproj
 ```
 
 Then press `⌘ + R` to build and run.
-
-**Option 2 — Download release**
-
-Head to the [Releases](https://github.com/spraveenk91/iResignX/releases) page and download the latest `.zip`, unzip, and drag `iResignX.app` to your `/Applications` folder.
 
 ---
 
