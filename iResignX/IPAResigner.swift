@@ -9,27 +9,36 @@ import Foundation
 import UniformTypeIdentifiers
 import AppKit
 
+// MARK: - Result type
+
+struct ResignResult {
+    let success: Bool
+    let message: String
+}
+
+// MARK: - Errors
+
 enum IPAResignerError: Error, LocalizedError {
     case appBundleNotFound
     case infoPlistUnreadable
     case provisioningProfileUnreadable
     case entitlementsNotFound
-    case identityNotFound
+    case noIdentityProvided
     case saveCancelled
     case commandFailed(String, Int32)
 
     var errorDescription: String? {
         switch self {
         case .appBundleNotFound:
-            return "No .app bundle found inside Payload directory."
+            return "No .app bundle found inside the Payload directory."
         case .infoPlistUnreadable:
             return "Could not read Info.plist from the app bundle."
         case .provisioningProfileUnreadable:
             return "Could not decode the provisioning profile. Make sure it is a valid .mobileprovision file."
         case .entitlementsNotFound:
             return "No Entitlements key found in the provisioning profile."
-        case .identityNotFound:
-            return "No valid iPhone / Apple Distribution signing identity found in your Keychain."
+        case .noIdentityProvided:
+            return "No signing identity was provided."
         case .saveCancelled:
             return "Save cancelled by user."
         case .commandFailed(let output, let code):
@@ -38,16 +47,30 @@ enum IPAResignerError: Error, LocalizedError {
     }
 }
 
+// MARK: - IPAResigner
+
 enum IPAResigner {
 
-    static func resign(ipaURL: URL, profileURL: URL) -> String {
+    // MARK: Public API
+
+    /// Resigns an IPA with the given provisioning profile and signing identity.
+    /// Reports stage progress via `onStage` callback (called from background thread).
+    static func resign(
+        ipaURL: URL,
+        profileURL: URL,
+        identity: String,
+        onStage: @escaping (ResignStage) async -> Void
+    ) async -> ResignResult {
         let fileManager = FileManager.default
         let tempDir = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("iResignX_\(UUID().uuidString)")
         let payloadPath = tempDir.appendingPathComponent("Payload")
 
         do {
-            // ── Step 1: Unzip IPA into temp dir ──────────────────────────────────
+            guard !identity.isEmpty else { throw IPAResignerError.noIdentityProvided }
+
+            // ── Step 1: Unzip ─────────────────────────────────────────────────────
+            await onStage(.unpacking)
             try fileManager.createDirectory(at: tempDir, withIntermediateDirectories: true)
             try runOrThrow("unzip -q \(q(ipaURL.path)) -d \(q(tempDir.path))")
 
@@ -57,40 +80,33 @@ enum IPAResigner {
                 .first(where: { $0.pathExtension == "app" })
             else { throw IPAResignerError.appBundleNotFound }
 
-            // ── Step 3: Read version & build natively (no PlistBuddy) ────────────
-            // The sandbox blocks spawning /usr/libexec/PlistBuddy.
-            // Use PropertyListSerialization instead — no subprocess needed.
+            // ── Step 3: Read version & build natively ─────────────────────────────
             let (version, build) = try readVersionAndBuild(from: appPath)
 
-            // ── Step 4: Extract entitlements natively (no PlistBuddy / security) ─
-            // provisioning profiles are CMS-enveloped plists. Strip the CMS wrapper
-            // by scanning for the embedded XML plist payload directly in the raw bytes.
+            // ── Step 4: Extract entitlements natively ─────────────────────────────
+            await onStage(.entitlements)
             let entitlementsURL = try extractEntitlements(from: profileURL, into: tempDir)
 
-            // ── Step 5: Prepare bundle for re-signing ─────────────────────────────
+            // ── Step 5: Prepare bundle ────────────────────────────────────────────
+            await onStage(.preparing)
             let codeSigDir = appPath.appendingPathComponent("_CodeSignature")
             if fileManager.fileExists(atPath: codeSigDir.path) {
                 try fileManager.removeItem(at: codeSigDir)
             }
 
-            // Remove existing embedded.mobileprovision before copying —
-            // copyItem(at:to:) throws if the destination already exists.
             let embeddedProfileDest = appPath.appendingPathComponent("embedded.mobileprovision")
             if fileManager.fileExists(atPath: embeddedProfileDest.path) {
                 try fileManager.removeItem(at: embeddedProfileDest)
             }
             try fileManager.copyItem(at: profileURL, to: embeddedProfileDest)
 
-            // ── Step 6: Resolve signing identity ─────────────────────────────────
-            // `security find-identity` is allowed in sandbox (reads Keychain only).
-            let identity = try resolveSigningIdentity()
-
-            // ── Step 7: Re-sign frameworks, plugins, then the .app itself ─────────
+            // ── Step 6: Re-sign frameworks, plugins, then the .app ────────────────
+            await onStage(.signing)
             for subDir in ["Frameworks", "PlugIns"] {
                 let container = appPath.appendingPathComponent(subDir)
                 guard fileManager.fileExists(atPath: container.path) else { continue }
-                let items = try fileManager.contentsOfDirectory(at: container,
-                                                                includingPropertiesForKeys: nil)
+                let items = (try? fileManager.contentsOfDirectory(
+                    at: container, includingPropertiesForKeys: nil)) ?? []
                 for item in items {
                     try runOrThrow(
                         "/usr/bin/codesign -f -s \(q(identity)) --entitlements \(q(entitlementsURL.path)) \(q(item.path))"
@@ -101,46 +117,70 @@ enum IPAResigner {
                 "/usr/bin/codesign -f -s \(q(identity)) --entitlements \(q(entitlementsURL.path)) \(q(appPath.path))"
             )
 
-            // ── Step 8: Ask user where to save ───────────────────────────────────
+            // ── Step 7: Ask user where to save (main thread) ──────────────────────
             let appName    = ipaURL.deletingPathExtension().lastPathComponent
             let outputName = "\(appName)_\(version)_\(build)_Resigned.ipa"
-            guard let saveURL = promptSaveLocation(defaultName: outputName) else {
+            guard let saveURL = await promptSaveLocation(defaultName: outputName) else {
                 throw IPAResignerError.saveCancelled
             }
 
-            // Zip entirely within NSTemporaryDirectory (always writable by the app).
-            // The zip subprocess does NOT inherit the NSSavePanel sandbox permission,
-            // so zipping directly to the user-chosen path fails with exit code 10.
-            // Instead: zip to temp, then move via FileManager (which honours the grant).
+            // ── Step 8: Repack into temp dir first, then move ─────────────────────
+            await onStage(.repacking)
             let packedURL = tempDir.appendingPathComponent(outputName)
             try runOrThrow("zip -qr \(q(packedURL.path)) Payload", workingDirectory: tempDir)
 
-            // Move finished IPA to user-chosen location (FileManager is sandbox-safe)
+            // FileManager.moveItem honours the NSSavePanel sandbox grant;
+            // subprocess zip does not — so we always zip to temp then move.
             if fileManager.fileExists(atPath: saveURL.path) {
                 try fileManager.removeItem(at: saveURL)
             }
             try fileManager.moveItem(at: packedURL, to: saveURL)
 
-            // ── Step 10: Cleanup ─────────────────────────────────────────────────
+            // ── Cleanup ───────────────────────────────────────────────────────────
             try? fileManager.removeItem(at: tempDir)
 
-            return "✅ Success! Resigned IPA saved to:\n\(saveURL.path)"
+            return ResignResult(
+                success: true,
+                message: "Resigned IPA saved to:\n\(saveURL.path)"
+            )
 
         } catch {
             try? fileManager.removeItem(at: tempDir)
-            return "❌ Error: \(error.localizedDescription)"
+            return ResignResult(success: false, message: error.localizedDescription)
         }
     }
 
-    // MARK: - Native plist reading (replaces PlistBuddy)
-    /// Reads CFBundleShortVersionString and CFBundleVersion from Info.plist
-    /// using PropertyListSerialization — no subprocess, sandbox-safe.
+    // MARK: - Fetch signing identities (used by UI picker)
+
+    /// Returns all valid iPhone / Apple Distribution identities from the Keychain.
+    static func fetchSigningIdentities() -> [String] {
+        guard
+            let output = try? runOrThrow("security find-identity -v -p codesigning")
+        else { return [] }
+
+        return output
+            .components(separatedBy: "\n")
+            .filter { $0.contains("iPhone") || $0.contains("Apple Distribution") }
+            .compactMap { line -> String? in
+                let parts = line.components(separatedBy: "\"")
+                guard parts.count >= 2 else { return nil }
+                let name = parts[1]
+                return name.isEmpty ? nil : name
+            }
+            // Remove duplicates (e.g. same cert in multiple keychains)
+            .reduce(into: [String]()) { result, identity in
+                if !result.contains(identity) { result.append(identity) }
+            }
+    }
+
+    // MARK: - Private helpers
+
+    /// Reads CFBundleShortVersionString and CFBundleVersion from Info.plist natively.
     private static func readVersionAndBuild(from appPath: URL) throws -> (version: String, build: String) {
         let plistURL = appPath.appendingPathComponent("Info.plist")
         let data = try Data(contentsOf: plistURL)
-
-        guard
-            let plist = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any]
+        guard let plist = try PropertyListSerialization
+            .propertyList(from: data, format: nil) as? [String: Any]
         else { throw IPAResignerError.infoPlistUnreadable }
 
         let version = (plist["CFBundleShortVersionString"] as? String) ?? "0.0"
@@ -148,15 +188,11 @@ enum IPAResigner {
         return (version, build)
     }
 
-    // MARK: - Native entitlements extraction (replaces security cms + PlistBuddy)
-    /// Provisioning profiles are CMS (PKCS#7) signed blobs that contain an
-    /// embedded XML plist.  We don't need to verify the signature here — we just
-    /// need the plist payload, so we scan the raw bytes for the XML header and
-    /// trailer and slice it out.  This is sandbox-safe and requires no subprocess.
+    /// Extracts the Entitlements dict from a .mobileprovision by scanning for
+    /// the embedded XML plist — no subprocess needed, fully sandbox-safe.
     private static func extractEntitlements(from profileURL: URL, into tempDir: URL) throws -> URL {
         let raw = try Data(contentsOf: profileURL)
 
-        // The embedded plist always starts with "<?xml" and ends with "</plist>"
         guard
             let xmlStart = raw.range(of: Data("<?xml".utf8)),
             let xmlEnd   = raw.range(of: Data("</plist>".utf8))
@@ -170,7 +206,6 @@ enum IPAResigner {
             let entitlementsDict = profile["Entitlements"] as? [String: Any]
         else { throw IPAResignerError.entitlementsNotFound }
 
-        // Serialise entitlements back to an XML plist file for codesign --entitlements
         let entData = try PropertyListSerialization.data(
             fromPropertyList: entitlementsDict,
             format: .xml,
@@ -181,30 +216,14 @@ enum IPAResigner {
         return entURL
     }
 
-    // MARK: - Signing identity resolution
-    private static func resolveSigningIdentity() throws -> String {
-        // `security find-identity` only reads the Keychain — allowed in sandbox.
-        let output = try runOrThrow("security find-identity -v -p codesigning")
-        let identity = output
-            .components(separatedBy: "\n")
-            .first(where: { $0.contains("iPhone") || $0.contains("Apple Distribution") })?
-            .components(separatedBy: "\"")
-            .dropFirst()
-            .first ?? ""
-
-        guard !identity.isEmpty else { throw IPAResignerError.identityNotFound }
-        return identity
-    }
-
-    // MARK: - Shell helper
-    /// Wraps a path in single-quotes, escaping any embedded single-quotes.
+    /// Wraps a path in single-quotes, escaping embedded single-quotes.
     private static func q(_ path: String) -> String {
         "'\(path.replacingOccurrences(of: "'", with: "'\\''"))'"
     }
 
-    /// Runs a shell command via zsh, throws a typed error if the exit code ≠ 0.
+    /// Runs a shell command; throws a typed error if exit code ≠ 0.
     @discardableResult
-    private static func runOrThrow(_ command: String, workingDirectory: URL? = nil) throws -> String {
+    static func runOrThrow(_ command: String, workingDirectory: URL? = nil) throws -> String {
         let task    = Process()
         let outPipe = Pipe()
         let errPipe = Pipe()
@@ -233,22 +252,18 @@ enum IPAResigner {
         return output
     }
 
-    // MARK: - Save panel
-    private static func promptSaveLocation(defaultName: String) -> URL? {
-        var selectedURL: URL?
-        let block = {
-            let panel = NSSavePanel()
-            panel.title                = "Save Resigned IPA"
-            panel.nameFieldStringValue = defaultName
-            if #available(macOS 11.0, *) {
-                panel.allowedContentTypes = [UTType(filenameExtension: "ipa") ?? .data]
-            } else {
-                panel.allowedFileTypes = ["ipa"]
-            }
-            if panel.runModal() == .OK { selectedURL = panel.url }
-        }
+    // MARK: - Save panel (async, main-thread safe)
 
-        Thread.isMainThread ? block() : DispatchQueue.main.sync { block() }
-        return selectedURL
+    @MainActor
+    private static func promptSaveLocation(defaultName: String) -> URL? {
+        let panel = NSSavePanel()
+        panel.title                = "Save Resigned IPA"
+        panel.nameFieldStringValue = defaultName
+        if #available(macOS 11.0, *) {
+            panel.allowedContentTypes = [UTType(filenameExtension: "ipa") ?? .data]
+        } else {
+            panel.allowedFileTypes = ["ipa"]
+        }
+        return panel.runModal() == .OK ? panel.url : nil
     }
 }

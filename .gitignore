@@ -1,0 +1,26 @@
+## Xcode
+
+## Reports generated on build machine
+devbox_reports/
+
+## Build generated
+build/
+DerivedData/
+
+## Various settings
+*.pbxuser
+!default.pbxuser
+xcuserdata/
+xcshareddata/
+contents.xcworkspacedata
+
+## Other
+*.moved-aside
+*.xccheckout
+*.xcscmblueprint
+
+## Obj-C/Swift specific
+*.hmap
+
+
+.DS_Store
