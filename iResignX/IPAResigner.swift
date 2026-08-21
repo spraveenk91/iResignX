@@ -160,7 +160,11 @@ enum IPAResigner {
 
         return output
             .components(separatedBy: "\n")
-            .filter { $0.contains("iPhone") || $0.contains("Apple Distribution") }
+            .filter {
+                $0.contains("iPhone")
+                || $0.contains("Apple Development")
+                || $0.contains("Apple Distribution")
+            }
             .compactMap { line -> String? in
                 let parts = line.components(separatedBy: "\"")
                 guard parts.count >= 2 else { return nil }
